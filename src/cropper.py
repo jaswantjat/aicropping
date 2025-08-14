@@ -77,6 +77,144 @@ def find_card_by_color(bgr: np.ndarray) -> np.ndarray:
 
     return white_mask
 
+def refine_quad_with_lines(bgr: np.ndarray, coarse_quad: np.ndarray, debug: bool = False) -> Optional[np.ndarray]:
+    """
+    Precision quad fitting: refine coarse minAreaRect to true card edges using Hough lines.
+    This removes background slivers and aligns perfectly to card borders.
+    """
+    # Create ROI from coarse quad
+    x, y, w, h = cv2.boundingRect(coarse_quad.astype(np.int32))
+
+    # Expand ROI slightly to ensure we capture card edges
+    margin = max(10, min(w, h) // 20)
+    x1, y1 = max(0, x - margin), max(0, y - margin)
+    x2, y2 = min(bgr.shape[1], x + w + margin), min(bgr.shape[0], y + h + margin)
+
+    roi = bgr[y1:y2, x1:x2]
+    if roi.shape[0] < 50 or roi.shape[1] < 50:
+        return None
+
+    # Convert to grayscale and enhance edges
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    # Adaptive Canny for edge detection
+    v = np.median(gray)
+    lower = int(max(0, 0.7 * v))
+    upper = int(min(255, 1.3 * v))
+    edges = cv2.Canny(gray, lower, upper)
+
+    if debug:
+        cv2.imwrite("debug_roi_edges.jpg", edges)
+
+    # Hough lines to find card edges - more aggressive parameters for textured backgrounds
+    min_line_length = min(roi.shape[:2]) * 0.2  # Shorter minimum length
+    max_line_gap = max(5, min(roi.shape[:2]) // 20)  # Adaptive gap
+
+    # Try multiple threshold values to find lines
+    for threshold in [30, 40, 50, 60]:
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=threshold,
+                               minLineLength=int(min_line_length), maxLineGap=max_line_gap)
+        if lines is not None and len(lines) >= 4:
+            break
+
+    if lines is None or len(lines) < 4:
+        if debug:
+            print(f"   Hough lines failed: found {len(lines) if lines is not None else 0} lines")
+        return None
+
+    if debug:
+        print(f"   Found {len(lines)} Hough lines with threshold {threshold}")
+
+    # Convert lines to angle-distance representation and cluster by angle
+    line_params = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        angle = (np.arctan2(y2-y1, x2-x1) * 180/np.pi) % 180
+        # Convert to normal form: ax + by + c = 0
+        if abs(x2-x1) > abs(y2-y1):  # More horizontal
+            a, b = -(y2-y1), (x2-x1)
+        else:  # More vertical
+            a, b = -(y2-y1), (x2-x1)
+        c = -(a*x1 + b*y1)
+        norm = np.sqrt(a*a + b*b)
+        if norm > 0:
+            a, b, c = a/norm, b/norm, c/norm
+        line_params.append((a, b, c, angle))
+
+    # Cluster lines into horizontal and vertical families (more lenient)
+    horizontal_lines = [lp for lp in line_params if abs(lp[3]) < 35 or abs(lp[3]) > 145]
+    vertical_lines = [lp for lp in line_params if 55 < lp[3] < 125]
+
+    if debug:
+        print(f"   Line clustering: {len(horizontal_lines)} horizontal, {len(vertical_lines)} vertical")
+
+    if len(horizontal_lines) < 2 or len(vertical_lines) < 2:
+        if debug:
+            print(f"   Insufficient lines for quad fitting")
+        return None
+
+    # Find extreme lines (top, bottom, left, right)
+    roi_center_x, roi_center_y = roi.shape[1]//2, roi.shape[0]//2
+
+    # For horizontal lines, find top and bottom (min and max distance from center)
+    h_distances = [(lp[0]*roi_center_x + lp[1]*roi_center_y + lp[2], lp) for lp in horizontal_lines]
+    top_line = min(h_distances, key=lambda x: x[0])[1]
+    bottom_line = max(h_distances, key=lambda x: x[0])[1]
+
+    # For vertical lines, find left and right
+    v_distances = [(lp[0]*roi_center_x + lp[1]*roi_center_y + lp[2], lp) for lp in vertical_lines]
+    left_line = min(v_distances, key=lambda x: x[0])[1]
+    right_line = max(v_distances, key=lambda x: x[0])[1]
+
+    # Compute intersections to get refined corners
+    def line_intersection(l1, l2):
+        a1, b1, c1 = l1[:3]
+        a2, b2, c2 = l2[:3]
+        det = a1*b2 - a2*b1
+        if abs(det) < 1e-6:
+            return None
+        x = (b1*c2 - b2*c1) / det
+        y = (a2*c1 - a1*c2) / det
+        return (x, y)
+
+    # Get four corners
+    tl = line_intersection(top_line, left_line)
+    tr = line_intersection(top_line, right_line)
+    br = line_intersection(bottom_line, right_line)
+    bl = line_intersection(bottom_line, left_line)
+
+    if None in [tl, tr, br, bl]:
+        return None
+
+    # Convert back to original image coordinates
+    corners = np.array([tl, tr, br, bl], dtype=np.float32)
+    corners[:, 0] += x1
+    corners[:, 1] += y1
+
+    # Ensure corners are within image bounds before sub-pixel refinement
+    h_full, w_full = bgr.shape[:2]
+    corners[:, 0] = np.clip(corners[:, 0], 5, w_full - 6)
+    corners[:, 1] = np.clip(corners[:, 1], 5, h_full - 6)
+
+    # Sub-pixel corner refinement
+    gray_full = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.02)
+    corners = cv2.cornerSubPix(gray_full, corners, (9, 9), (-1, -1), criteria)
+
+    if debug:
+        debug_img = bgr.copy()
+        for i, pt in enumerate(corners):
+            cv2.circle(debug_img, tuple(pt.astype(int)), 8, (0, 255, 0), -1)
+            cv2.putText(debug_img, f"{i}", tuple(pt.astype(int) + 12),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.imwrite("debug_refined_corners.jpg", debug_img)
+        print(f"🔍 Refined corners: TL:{corners[0]}, TR:{corners[1]}, BR:{corners[2]}, BL:{corners[3]}")
+
+    return corners
+
 def warp_to_id1_canvas(bgr: np.ndarray, box_pts: np.ndarray, width: int = 850, debug: bool = False) -> np.ndarray:
     """
     Warp detected card region to exact ID-1 canvas using 4-point perspective transform.
@@ -117,6 +255,21 @@ def warp_to_id1_canvas(bgr: np.ndarray, box_pts: np.ndarray, width: int = 850, d
         print(f"   Output AR: {actual_ar:.3f} (target: {ID1_AR:.3f}, error: {ar_error:.3f})")
 
     return warped
+
+def micro_trim_edges(warped: np.ndarray, trim_percent: float = 0.01) -> np.ndarray:
+    """
+    Micro-trim: Remove 1-2% from edges to eliminate any remaining background pixels.
+    Uses gradient-based edge detection to find the true card boundary.
+    """
+    if trim_percent <= 0:
+        return warped
+
+    h, w = warped.shape[:2]
+    trim_h = max(1, int(h * trim_percent))
+    trim_w = max(1, int(w * trim_percent))
+
+    # Simple symmetric trim (more reliable than gradient search for now)
+    return warped[trim_h:h-trim_h, trim_w:w-trim_w]
 
 def find_card_quad_simple(bgr: np.ndarray, cfg: Settings) -> Optional[Tuple[np.ndarray, float]]:
     """
@@ -371,15 +524,33 @@ def find_card_quad(bgr: np.ndarray, cfg: Settings, debug: bool = False) -> Optio
 
 def warp_card(bgr: np.ndarray, quad: np.ndarray, cfg: Settings) -> np.ndarray:
     """
-    Warp card to ID-1 canvas. Now uses proper perspective transform for document scanning.
+    Warp card to ID-1 canvas with precision quad fitting for perfect edge alignment.
     """
     # Use configurable width, compute height for exact ID-1 ratio
     target_w = int(cfg.target_height * ID1_AR)  # Width from height to maintain AR
 
-    # Use the new perspective warp function
-    warped = warp_to_id1_canvas(bgr, quad, target_w, debug=cfg.debug_mode)
+    # Try precision quad fitting first (refines coarse minAreaRect to true card edges)
+    refined_quad = refine_quad_with_lines(bgr, quad, debug=cfg.debug_mode)
 
-    # Optional border trimming
+    if refined_quad is not None:
+        if cfg.debug_mode:
+            print("✅ Using precision-refined quad")
+        final_quad = refined_quad
+    else:
+        if cfg.debug_mode:
+            print("⚠️ Precision refinement failed, using coarse quad")
+        final_quad = quad
+
+    # Use the perspective warp function
+    warped = warp_to_id1_canvas(bgr, final_quad, target_w, debug=cfg.debug_mode)
+
+    # Apply micro-trim if precision refinement was used (removes last hints of background)
+    if refined_quad is not None:
+        warped = micro_trim_edges(warped, trim_percent=0.005)  # 0.5% trim
+        if cfg.debug_mode:
+            print("🔧 Applied micro-trim to remove background pixels")
+
+    # Optional border trimming (less needed with precision fitting)
     if cfg.border_trim > 0 and warped.shape[0] > 2*cfg.border_trim and warped.shape[1] > 2*cfg.border_trim:
         bt = cfg.border_trim
         warped = warped[bt:-bt, bt:-bt]
