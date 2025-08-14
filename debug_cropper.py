@@ -65,18 +65,19 @@ def debug_quad_detection(image_path_or_pil):
     cfg = Settings()
     print(f"⚙️ Using settings: ar_tol={cfg.ar_tol}, min_area_frac={cfg.min_area_frac}")
     
-    quad = find_card_quad(bgr, cfg)
-    
-    if quad is not None:
+    quad_result = find_card_quad(bgr, cfg)
+
+    if quad_result is not None:
+        quad, det_score = quad_result
         print(f"✅ Found quad with corners:")
         for i, corner in enumerate(quad):
             print(f"   Corner {i}: ({corner[0]:.1f}, {corner[1]:.1f})")
-        
+
         # Calculate area and aspect ratio
         area = cv2.contourArea(quad.astype(np.float32))
         H, W = bgr.shape[:2]
         area_frac = area / (H * W)
-        
+
         # Calculate aspect ratio of detected quad
         pts = quad
         wA = np.linalg.norm(pts[2]-pts[3])
@@ -86,8 +87,9 @@ def debug_quad_detection(image_path_or_pil):
         w = (wA+wB)/2.0
         h = (hA+hB)/2.0
         ar = w/h if h > 0 else 0
-        
+
         print(f"📊 Quad stats:")
+        print(f"   Detection score: {det_score:.3f}")
         print(f"   Area fraction: {area_frac:.3f}")
         print(f"   Aspect ratio: {ar:.3f} (target: 1.586)")
         print(f"   AR error: {abs(ar - 1.586)/1.586:.3f}")

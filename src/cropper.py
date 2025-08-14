@@ -40,30 +40,68 @@ def bgr_to_pil(bgr: np.ndarray) -> Image.Image:
 
 def order_pts(pts: np.ndarray) -> np.ndarray:
     """
-    Deterministic point ordering that guarantees UL-UR-LR-LL order
-    regardless of contour detection order.
+    Deterministic point ordering that guarantees TL-TR-BR-BL order
+    regardless of contour detection order. Critical for perspective transform.
     """
     pts = pts.reshape(4, 2)
-    s = pts.sum(1)  # sum of x + y coordinates
-    diff = np.diff(pts, axis=1)  # difference x - y coordinates
+    s = pts.sum(axis=1)  # sum of x + y coordinates
+    d = np.diff(pts, axis=1)[:, 0]  # difference x - y coordinates
 
     # Top-left: smallest sum (x + y)
     tl = pts[np.argmin(s)]
-    # Top-right: smallest difference (x - y)
-    tr = pts[np.argmin(diff)]
     # Bottom-right: largest sum (x + y)
     br = pts[np.argmax(s)]
+    # Top-right: smallest difference (x - y)
+    tr = pts[np.argmin(d)]
     # Bottom-left: largest difference (x - y)
-    bl = pts[np.argmax(diff)]
+    bl = pts[np.argmax(d)]
 
     return np.array([tl, tr, br, bl], dtype="float32")
 
-def find_card_quad(bgr: np.ndarray, cfg: Settings) -> Optional[np.ndarray]:
+def warp_to_id1_canvas(bgr: np.ndarray, box_pts: np.ndarray, width: int = 850) -> np.ndarray:
+    """
+    Warp detected card region to exact ID-1 canvas using 4-point perspective transform.
+    This removes skew, fills frame with card, and creates proper top-down scan.
+    """
+    src = order_pts(box_pts.astype(np.float32))
+    height = int(round(width / ID1_AR))  # Exact ID-1 aspect ratio
+
+    # Destination points for perfect rectangle
+    dst = np.array([
+        [0, 0],                    # top-left
+        [width-1, 0],              # top-right
+        [width-1, height-1],       # bottom-right
+        [0, height-1]              # bottom-left
+    ], dtype=np.float32)
+
+    # Compute perspective transform matrix
+    M = cv2.getPerspectiveTransform(src, dst)
+
+    # Apply transform with high-quality interpolation
+    warped = cv2.warpPerspective(bgr, M, (width, height), flags=cv2.INTER_CUBIC)
+
+    return warped
+
+def find_card_quad(bgr: np.ndarray, cfg: Settings) -> Optional[Tuple[np.ndarray, float]]:
+    """
+    Find ID card quadrilateral using minAreaRect for better rotated rectangle detection.
+    Returns (box_points, detection_score) or None if no card found.
+    """
     H, W = bgr.shape[:2]
     scale = cfg.max_side_px / max(H, W)
     img = cv2.resize(bgr, None, fx=scale, fy=scale) if scale < 1 else bgr.copy()
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray,(5,5),0)
+
+    # CLAHE preprocessing on L channel for better edge detection on textured backgrounds
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l_channel = lab[:, :, 0]
+
+    # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_channel = clahe.apply(l_channel)
+
+    # Convert back to grayscale for edge detection
+    gray = l_channel
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
     # Adaptive Canny thresholds based on median
     v = np.median(gray)
@@ -76,107 +114,124 @@ def find_card_quad(bgr: np.ndarray, cfg: Settings) -> Optional[np.ndarray]:
     cnts,_ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts: return None
 
-    img_area = img.shape[0]*img.shape[1]
-
-    # Keep only contours with ~ID-1 aspect ratio
+    img_area = img.shape[0] * img.shape[1]
     candidates = []
+
+    # Score candidates using minAreaRect for better rotated rectangle handling
     for cnt in cnts:
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02*peri, True)
-        if len(approx) == 4 and cv2.isContourConvex(approx):
-            x, y, w, h = cv2.boundingRect(approx)
-            if h <= 0: continue
-            ar = w / float(h)
-            area = cv2.contourArea(approx)
+        area = cv2.contourArea(cnt)
+        if area < cfg.min_area_frac * img_area:
+            continue
 
-            # Strict aspect ratio filter for ID cards (1.45 < AR < 1.75)
-            # and minimum area requirement (15% of frame)
-            if (1.45 < ar < 1.75 and
-                area > 0.15 * img_area and
-                area <= cfg.max_area_frac * img_area):
-                candidates.append((area, approx))
+        # Get minimum area rectangle (handles rotation better)
+        rect = cv2.minAreaRect(cnt)
+        box = cv2.boxPoints(rect)
+        box_area = cv2.contourArea(box)
 
-    if not candidates:
-        # Fallback: try with more lenient aspect ratio
-        for cnt in cnts:
-            peri = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.02*peri, True)
-            if len(approx) == 4 and cv2.isContourConvex(approx):
-                area = cv2.contourArea(approx)
-                if (cfg.min_area_frac*img_area <= area <= cfg.max_area_frac*img_area):
-                    pts = approx.reshape(4,2).astype("float32")
-                    pts_o = order_pts(pts)
-                    wA = np.linalg.norm(pts_o[2]-pts_o[3]); wB = np.linalg.norm(pts_o[1]-pts_o[0])
-                    hA = np.linalg.norm(pts_o[1]-pts_o[2]); hB = np.linalg.norm(pts_o[0]-pts_o[3])
-                    w = (wA+wB)/2.0; h = (hA+hB)/2.0
-                    if h <= 0 or w <= 0: continue
-                    ar = w/h
-                    ar_err = abs(ar - ID1_AR) / ID1_AR
-                    if ar_err <= cfg.ar_tol:
-                        candidates.append((area, approx))
+        if box_area <= 0:
+            continue
+
+        # Calculate aspect ratio from rotated rectangle
+        (_, _), (w, h), angle = rect
+        ar = max(w, h) / min(w, h) if min(w, h) > 0 else 0
+
+        # Score based on multiple factors
+        area_frac = area / img_area
+        ar_error = abs(ar - ID1_AR) / ID1_AR
+        rectangularity = area / box_area  # How rectangular is the contour
+
+        # Composite score: prefer large, rectangular, ID-1 aspect ratio
+        score = (
+            2.0 * area_frac +           # Size importance
+            1.0 * rectangularity +      # Shape regularity
+            -1.0 * ar_error            # Aspect ratio closeness
+        )
+
+        # Filter candidates
+        if (1.4 < ar < 1.8 and                    # Reasonable aspect ratio range
+            area_frac > 0.05 and                  # Minimum size
+            area_frac <= cfg.max_area_frac and    # Maximum size
+            rectangularity > 0.7):               # Must be reasonably rectangular
+
+            candidates.append((score, box, area_frac))
 
     if candidates:
-        # Get largest valid quad
-        _, best_approx = max(candidates, key=lambda x: x[0])
-        pts = best_approx.reshape(4,2).astype("float32")
-        return order_pts(pts) / (scale if scale < 1 else 1)
+        # Get best candidate by score
+        best_score, best_box, best_area_frac = max(candidates, key=lambda x: x[0])
+        # Scale back to original image coordinates
+        scaled_box = best_box / (scale if scale < 1 else 1)
+        return order_pts(scaled_box.astype("float32")), best_score
 
-    # Final fallback: largest rotated box
+    # Fallback: largest contour as rotated rectangle
     if cnts:
         c = max(cnts, key=cv2.contourArea)
         rect = cv2.minAreaRect(c)
         box = cv2.boxPoints(rect)
-        return order_pts((box/(scale if scale<1 else 1)).astype("float32"))
+        scaled_box = box / (scale if scale < 1 else 1)
+        return order_pts(scaled_box.astype("float32")), 0.0
 
     return None
 
 def warp_card(bgr: np.ndarray, quad: np.ndarray, cfg: Settings) -> np.ndarray:
-    # Use target_height and maintain exact ID-1 aspect ratio
-    target_h = int(cfg.target_height)
-    target_w = int(target_h * ID1_AR)  # maintain exact ratio
+    """
+    Warp card to ID-1 canvas. Now uses proper perspective transform for document scanning.
+    """
+    # Use configurable width, compute height for exact ID-1 ratio
+    target_w = int(cfg.target_height * ID1_AR)  # Width from height to maintain AR
 
-    dst = np.array([[0,0],[target_w-1,0],[target_w-1,target_h-1],[0,target_h-1]], dtype="float32")
-    M = cv2.getPerspectiveTransform(quad, dst)
-    warped = cv2.warpPerspective(bgr, M, (target_w, target_h), flags=cv2.INTER_CUBIC)
+    # Use the new perspective warp function
+    warped = warp_to_id1_canvas(bgr, quad, target_w)
 
+    # Optional border trimming
     if cfg.border_trim > 0 and warped.shape[0] > 2*cfg.border_trim and warped.shape[1] > 2*cfg.border_trim:
         bt = cfg.border_trim
         warped = warped[bt:-bt, bt:-bt]
+
     return warped
 
-def orient_with_tesseract(bgr: np.ndarray) -> Tuple[np.ndarray, int, float]:
+def orient_with_osd(img_bgr: np.ndarray, min_width: int = 1000, conf_thresh: float = 5.0) -> Tuple[np.ndarray, int, float]:
+    """
+    Enhanced OSD with proper upscaling, binarization, and confidence parsing.
+    Returns (corrected_image, rotation_degrees, confidence_score)
+    """
     try:
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        # Convert to grayscale
+        g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-        # Try OSD detection first
-        try:
-            osd = pytesseract.image_to_osd(rgb, output_type=Output.DICT)
-            rot = int(osd.get("rotate", 0))
-            conf = float(osd.get("orientation_confidence", 0.0))
-        except:
-            # Fallback: try string-based OSD parsing
-            osd_str = pytesseract.image_to_osd(rgb)
-            rot_match = re.search(r'Rotate: (\d+)', osd_str)
-            rot = int(rot_match.group(1)) if rot_match else 0
-            conf_match = re.search(r'Orientation confidence: ([\d.]+)', osd_str)
-            conf = float(conf_match.group(1)) if conf_match else 0.0
+        # Upscale if too small (OSD works better on larger images)
+        if g.shape[1] < min_width:
+            scale = float(min_width) / g.shape[1]
+            new_width = min_width
+            new_height = int(g.shape[0] * scale)
+            g = cv2.resize(g, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
 
-        # Apply rotation correction
-        if rot in (90, 180, 270):
-            if imutils is not None:
-                # Use imutils for better rotation (handles bounds properly)
-                bgr = imutils.rotate_bound(bgr, -rot)  # negative to correct rotation
-            else:
-                # Fallback to cv2 rotation
-                rot_map = {90: cv2.ROTATE_90_COUNTERCLOCKWISE,
-                          180: cv2.ROTATE_180,
-                          270: cv2.ROTATE_90_CLOCKWISE}
-                bgr = cv2.rotate(bgr, rot_map[rot])
+        # Binarize with Otsu thresholding for better OSD accuracy
+        _, g = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
 
-        return bgr, rot, conf
+        # Run OSD with PSM 0 (orientation and script detection only)
+        osd_output = pytesseract.image_to_osd(g, config="--psm 0")
+
+        # Parse rotation and confidence from output
+        rot_match = re.search(r"Rotate:\s+(\d+)", osd_output)
+        conf_match = re.search(r"Orientation confidence:\s+([\d.]+)", osd_output)
+
+        rot = int(rot_match.group(1)) if rot_match else 0
+        conf = float(conf_match.group(1)) if conf_match else 0.0
+
+        # Apply rotation correction only if confident
+        if conf >= conf_thresh and rot in (90, 180, 270):
+            if rot == 90:
+                img_bgr = cv2.rotate(img_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            elif rot == 180:
+                img_bgr = cv2.rotate(img_bgr, cv2.ROTATE_180)
+            elif rot == 270:
+                img_bgr = cv2.rotate(img_bgr, cv2.ROTATE_90_CLOCKWISE)
+
+        return img_bgr, rot, conf
+
     except Exception as e:
-        # If Tesseract fails completely, return original image
-        return bgr, 0, 0.0
+        # If OSD fails completely, return original image with zero confidence
+        return img_bgr, 0, 0.0
 
 def blur_metric(bgr: np.ndarray) -> float:
     g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -187,31 +242,58 @@ def process_image_bytes(data: bytes, cfg: Settings) -> Dict[str, Any]:
     pil = _exif_correct(Image.open(io.BytesIO(data)))
     bgr = pil_to_bgr(pil)
 
-    H,W = bgr.shape[:2]
-    quad = find_card_quad(bgr, cfg)
-    if quad is None:
-        return {"ok": False, "reason": "no_quad", "meta": {"H":H,"W":W}}
+    H, W = bgr.shape[:2]
+    quad_result = find_card_quad(bgr, cfg)
+    if quad_result is None:
+        return {"ok": False, "reason": "no_quad", "meta": {"H": H, "W": W}}
 
+    quad, det_score = quad_result
     area = cv2.contourArea(quad.astype(np.float32))
-    area_frac = float(area/(H*W))
+    area_frac = float(area / (H * W))
 
+    # Warp to proper ID-1 canvas (removes skew and background)
     warped = warp_card(bgr, quad, cfg)
-    ar_after = warped.shape[1]/warped.shape[0]
-    ar_err_after = abs(ar_after - ID1_AR)/ID1_AR
+    ar_after = warped.shape[1] / warped.shape[0]
+    ar_err_after = abs(ar_after - ID1_AR) / ID1_AR
 
-    warped, rot, conf = orient_with_tesseract(warped)
+    # Enhanced OSD with real confidence
+    warped, rot, osd_conf = orient_with_osd(warped)
     blur = blur_metric(warped)
 
-    # gates
+    # Quality gates
     if not (cfg.min_area_frac <= area_frac <= cfg.max_area_frac):
-        return {"ok": False, "reason": "area_gate", "meta": {"area_frac": area_frac, "ar_after": ar_after, "rotate": rot, "rotate_conf": conf, "blur_var": blur}}
-    if ar_err_after > cfg.ar_tol_after:
-        return {"ok": False, "reason": "ar_gate", "meta": {"area_frac": area_frac, "ar_after": ar_after, "rotate": rot, "rotate_conf": conf, "blur_var": blur}}
+        return {
+            "ok": False,
+            "reason": "area_gate",
+            "meta": {
+                "area_frac": area_frac,
+                "ar_after": ar_after,
+                "rotate": rot,
+                "det_score": det_score,
+                "osd_conf": osd_conf,
+                "blur_var": blur
+            }
+        }
 
-    # encode
+    if ar_err_after > cfg.ar_tol_after:
+        return {
+            "ok": False,
+            "reason": "ar_gate",
+            "meta": {
+                "area_frac": area_frac,
+                "ar_after": ar_after,
+                "rotate": rot,
+                "det_score": det_score,
+                "osd_conf": osd_conf,
+                "blur_var": blur
+            }
+        }
+
+    # Encode final result
     ok, buf = cv2.imencode(".jpg", warped, [int(cv2.IMWRITE_JPEG_QUALITY), int(cfg.jpeg_quality)])
     if not ok:
         return {"ok": False, "reason": "encode_fail", "meta": {}}
+
     return {
         "ok": True,
         "reason": "ok",
@@ -220,8 +302,10 @@ def process_image_bytes(data: bytes, cfg: Settings) -> Dict[str, Any]:
             "area_frac": area_frac,
             "ar_after": ar_after,
             "rotate": rot,
-            "rotate_conf": conf,
+            "det_score": det_score,      # Detection quality score
+            "osd_conf": osd_conf,        # OSD rotation confidence
             "blur_var": blur,
-            "out_w": int(warped.shape[1]), "out_h": int(warped.shape[0])
+            "out_w": int(warped.shape[1]),
+            "out_h": int(warped.shape[0])
         }
     }

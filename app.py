@@ -111,7 +111,8 @@ if run_btn and files:
                 caption = (f"✅ {f.name}\n"
                           f"AR: {meta.get('ar_after', 0):.3f} | "
                           f"Rotation: {meta.get('rotate', 0)}° | "
-                          f"Confidence: {meta.get('rotate_conf', 0):.1f} | "
+                          f"Det Score: {meta.get('det_score', 0):.2f} | "
+                          f"OSD Conf: {meta.get('osd_conf', 0):.1f} | "
                           f"Time: {meta.get('latency_ms', 0)}ms")
                 st.image(r["image_bytes"], caption=caption, use_column_width=True)
             else:
