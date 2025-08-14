@@ -77,13 +77,24 @@ def find_card_by_color(bgr: np.ndarray) -> np.ndarray:
 
     return white_mask
 
-def warp_to_id1_canvas(bgr: np.ndarray, box_pts: np.ndarray, width: int = 850) -> np.ndarray:
+def warp_to_id1_canvas(bgr: np.ndarray, box_pts: np.ndarray, width: int = 850, debug: bool = False) -> np.ndarray:
     """
     Warp detected card region to exact ID-1 canvas using 4-point perspective transform.
     This removes skew, fills frame with card, and creates proper top-down scan.
     """
     src = order_pts(box_pts.astype(np.float32))
     height = int(round(width / ID1_AR))  # Exact ID-1 aspect ratio
+
+    # Debug: Save image with detected corners
+    if debug:
+        debug_img = bgr.copy()
+        for i, pt in enumerate(src):
+            cv2.circle(debug_img, tuple(pt.astype(int)), 10, (0, 255, 0), -1)
+            cv2.putText(debug_img, f"{i}", tuple(pt.astype(int) + 15),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.imwrite("debug_corners.jpg", debug_img)
+        print(f"🔍 Debug: Saved corner points to debug_corners.jpg")
+        print(f"   TL: {src[0]}, TR: {src[1]}, BR: {src[2]}, BL: {src[3]}")
 
     # Destination points for perfect rectangle
     dst = np.array([
@@ -98,6 +109,12 @@ def warp_to_id1_canvas(bgr: np.ndarray, box_pts: np.ndarray, width: int = 850) -
 
     # Apply transform with high-quality interpolation
     warped = cv2.warpPerspective(bgr, M, (width, height), flags=cv2.INTER_CUBIC)
+
+    # Debug: Verify output aspect ratio
+    if debug:
+        actual_ar = warped.shape[1] / warped.shape[0]
+        ar_error = abs(actual_ar - ID1_AR) / ID1_AR
+        print(f"   Output AR: {actual_ar:.3f} (target: {ID1_AR:.3f}, error: {ar_error:.3f})")
 
     return warped
 
@@ -157,7 +174,8 @@ def find_card_quad_simple(bgr: np.ndarray, cfg: Settings) -> Optional[Tuple[np.n
 
     if candidates:
         best_score, best_pts, best_area_frac = max(candidates, key=lambda x: x[0])
-        scaled_pts = best_pts / (scale if scale < 1 else 1)
+        # Scale back to original image coordinates
+        scaled_pts = best_pts / scale if scale < 1 else best_pts
         return scaled_pts.astype("float32"), best_score
 
     return None
@@ -244,7 +262,7 @@ def find_card_quad_advanced(bgr: np.ndarray, cfg: Settings) -> Optional[Tuple[np
         # Get best candidate by score
         best_score, best_box, best_area_frac = max(candidates, key=lambda x: x[0])
         # Scale back to original image coordinates
-        scaled_box = best_box / (scale if scale < 1 else 1)
+        scaled_box = best_box / scale if scale < 1 else best_box
         return order_pts(scaled_box.astype("float32")), best_score
 
     return None
@@ -311,7 +329,8 @@ def find_card_quad_color_assisted(bgr: np.ndarray, cfg: Settings) -> Optional[Tu
 
     if candidates:
         best_score, best_box, best_area_frac = max(candidates, key=lambda x: x[0])
-        scaled_box = best_box / (scale if scale < 1 else 1)
+        # Scale back to original image coordinates
+        scaled_box = best_box / scale if scale < 1 else best_box
         return order_pts(scaled_box.astype("float32")), best_score
 
     return None
@@ -358,7 +377,7 @@ def warp_card(bgr: np.ndarray, quad: np.ndarray, cfg: Settings) -> np.ndarray:
     target_w = int(cfg.target_height * ID1_AR)  # Width from height to maintain AR
 
     # Use the new perspective warp function
-    warped = warp_to_id1_canvas(bgr, quad, target_w)
+    warped = warp_to_id1_canvas(bgr, quad, target_w, debug=cfg.debug_mode)
 
     # Optional border trimming
     if cfg.border_trim > 0 and warped.shape[0] > 2*cfg.border_trim and warped.shape[1] > 2*cfg.border_trim:
