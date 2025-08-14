@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+.venv
+dist/
+build/
+out/
+logs/
+process_log.jsonl
+.streamlit/
+.DS_Store
