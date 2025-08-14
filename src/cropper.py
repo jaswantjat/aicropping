@@ -25,6 +25,7 @@ class Settings:
     canny_hi_mult: float = 1.5    # higher threshold for better edge detection
     dilate_iter: int = 2          # more dilation to connect edges
     border_trim: int = 2          # pixels to trim after warp
+    debug_mode: bool = False      # enable debug visualization
 
 def _exif_correct(pil_img: Image.Image) -> Image.Image:
     # respect EXIF orientation
@@ -82,16 +83,71 @@ def warp_to_id1_canvas(bgr: np.ndarray, box_pts: np.ndarray, width: int = 850) -
 
     return warped
 
-def find_card_quad(bgr: np.ndarray, cfg: Settings) -> Optional[Tuple[np.ndarray, float]]:
+def find_card_quad_simple(bgr: np.ndarray, cfg: Settings) -> Optional[Tuple[np.ndarray, float]]:
     """
-    Find ID card quadrilateral using minAreaRect for better rotated rectangle detection.
-    Returns (box_points, detection_score) or None if no card found.
+    Simple, robust card detection - the original working method.
+    """
+    H, W = bgr.shape[:2]
+    scale = cfg.max_side_px / max(H, W)
+    img = cv2.resize(bgr, None, fx=scale, fy=scale) if scale < 1 else bgr.copy()
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Simple adaptive Canny thresholds based on median
+    v = np.median(gray)
+    lower = int(max(0, 0.66 * v))
+    upper = int(min(255, 1.33 * v))
+    edges = cv2.Canny(gray, lower, upper)
+
+    if cfg.dilate_iter > 0:
+        edges = cv2.dilate(edges, np.ones((3,3),np.uint8), iterations=cfg.dilate_iter)
+
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+
+    img_area = img.shape[0] * img.shape[1]
+    candidates = []
+
+    # Try approxPolyDP method first (original working approach)
+    for cnt in cnts:
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02*peri, True)
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            area = cv2.contourArea(approx)
+            area_frac = area / img_area
+
+            if area_frac > cfg.min_area_frac and area_frac <= cfg.max_area_frac:
+                # Calculate aspect ratio
+                pts = approx.reshape(4,2).astype("float32")
+                pts_o = order_pts(pts)
+                wA = np.linalg.norm(pts_o[2]-pts_o[3]); wB = np.linalg.norm(pts_o[1]-pts_o[0])
+                hA = np.linalg.norm(pts_o[1]-pts_o[2]); hB = np.linalg.norm(pts_o[0]-pts_o[3])
+                w = (wA+wB)/2.0; h = (hA+hB)/2.0
+                if h <= 0 or w <= 0: continue
+                ar = w/h
+                ar_err = abs(ar - ID1_AR) / ID1_AR
+
+                if ar_err <= cfg.ar_tol:
+                    score = 2.0 * area_frac - 0.6 * ar_err
+                    candidates.append((score, pts_o, area_frac))
+
+    if candidates:
+        best_score, best_pts, best_area_frac = max(candidates, key=lambda x: x[0])
+        scaled_pts = best_pts / (scale if scale < 1 else 1)
+        return scaled_pts.astype("float32"), best_score
+
+    return None
+
+def find_card_quad_advanced(bgr: np.ndarray, cfg: Settings) -> Optional[Tuple[np.ndarray, float]]:
+    """
+    Advanced card detection with CLAHE and minAreaRect - for difficult cases.
     """
     H, W = bgr.shape[:2]
     scale = cfg.max_side_px / max(H, W)
     img = cv2.resize(bgr, None, fx=scale, fy=scale) if scale < 1 else bgr.copy()
 
-    # CLAHE preprocessing on L channel for better edge detection on textured backgrounds
+    # CLAHE preprocessing on L channel for textured backgrounds
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l_channel = lab[:, :, 0]
 
@@ -111,8 +167,9 @@ def find_card_quad(bgr: np.ndarray, cfg: Settings) -> Optional[Tuple[np.ndarray,
     if cfg.dilate_iter > 0:
         edges = cv2.dilate(edges, np.ones((3,3),np.uint8), iterations=cfg.dilate_iter)
 
-    cnts,_ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts: return None
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
 
     img_area = img.shape[0] * img.shape[1]
     candidates = []
@@ -162,13 +219,31 @@ def find_card_quad(bgr: np.ndarray, cfg: Settings) -> Optional[Tuple[np.ndarray,
         scaled_box = best_box / (scale if scale < 1 else 1)
         return order_pts(scaled_box.astype("float32")), best_score
 
-    # Fallback: largest contour as rotated rectangle
-    if cnts:
-        c = max(cnts, key=cv2.contourArea)
-        rect = cv2.minAreaRect(c)
-        box = cv2.boxPoints(rect)
-        scaled_box = box / (scale if scale < 1 else 1)
-        return order_pts(scaled_box.astype("float32")), 0.0
+    return None
+
+def find_card_quad(bgr: np.ndarray, cfg: Settings, debug: bool = False) -> Optional[Tuple[np.ndarray, float]]:
+    """
+    Hybrid card detection strategy: try simple method first, fall back to advanced.
+    This prevents over-engineering from breaking working cases.
+    """
+    # Strategy 1: Simple threshold (good for high-contrast, clean backgrounds)
+    result = find_card_quad_simple(bgr, cfg)
+    if result is not None:
+        quad, score = result
+        if debug:
+            print(f"✅ Simple method succeeded with score: {score:.3f}")
+        return result
+
+    # Strategy 2: Advanced method (good for textured backgrounds, shadows)
+    result = find_card_quad_advanced(bgr, cfg)
+    if result is not None:
+        quad, score = result
+        if debug:
+            print(f"✅ Advanced method succeeded with score: {score:.3f}")
+        return result
+
+    if debug:
+        print("❌ Both methods failed to find card")
 
     return None
 
