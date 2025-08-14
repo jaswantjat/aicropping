@@ -12,12 +12,38 @@ st.caption("OpenCV + Tesseract OSD. Drag-and-drop multiple photos at any angle a
 
 with st.sidebar:
     st.header("Processing settings")
+
+    # Preset configurations
+    preset = st.selectbox("Preset Configuration", [
+        "Default",
+        "Low Contrast",
+        "Textured Background",
+        "Small Card",
+        "Large Card",
+        "Extreme Perspective",
+        "Custom"
+    ])
+
+    # Set defaults based on preset
+    if preset == "Low Contrast":
+        default_ar_tol, default_min_area, default_dilate = 0.5, 0.01, 3
+    elif preset == "Textured Background":
+        default_ar_tol, default_min_area, default_dilate = 0.4, 0.05, 1
+    elif preset == "Small Card":
+        default_ar_tol, default_min_area, default_dilate = 0.6, 0.005, 2
+    elif preset == "Large Card":
+        default_ar_tol, default_min_area, default_dilate = 0.3, 0.3, 2
+    elif preset == "Extreme Perspective":
+        default_ar_tol, default_min_area, default_dilate = 0.8, 0.01, 4
+    else:  # Default or Custom
+        default_ar_tol, default_min_area, default_dilate = 0.35, 0.02, 2
+
     target_height = st.slider("Target height (px)", 400, 1200, 600, 50)
-    ar_tol = st.slider("AR tolerance before warp", 0.05, 0.50, 0.35, 0.01)
-    ar_tol_after = st.slider("AR tolerance after warp", 0.05, 0.30, 0.25, 0.01)
-    min_area = st.slider("Min area fraction", 0.01, 0.20, 0.02, 0.01)
+    ar_tol = st.slider("AR tolerance before warp", 0.05, 1.0, default_ar_tol, 0.01)
+    ar_tol_after = st.slider("AR tolerance after warp", 0.05, 0.50, 0.25, 0.01)
+    min_area = st.slider("Min area fraction", 0.001, 0.50, default_min_area, 0.001)
     max_area = st.slider("Max area fraction", 0.70, 1.00, 0.99, 0.01)
-    dilate_iter = st.selectbox("Dilate iterations", [0,1,2], index=2)
+    dilate_iter = st.selectbox("Dilate iterations", [0,1,2,3,4], index=default_dilate)
     border_trim = st.number_input("Border trim (px)", 0, 10, 2)
 
     st.subheader("Advanced")
@@ -25,13 +51,18 @@ with st.sidebar:
         canny_lo = st.slider("Canny low mult", 0.3, 1.0, 0.5, 0.01)
         canny_hi = st.slider("Canny high mult", 1.0, 2.5, 1.5, 0.01)
 
+    with st.expander("Debug Options"):
+        debug_mode = st.checkbox("Enable debug mode", help="Save failed images and show detailed debug info")
+        save_intermediates = st.checkbox("Save intermediate images", help="Save edge detection steps for analysis")
+
     run_btn = st.button("🚀 Process Images", type="primary")
 
 cfg = Settings(
     target_height=target_height, ar_tol=ar_tol, ar_tol_after=ar_tol_after,
     min_area_frac=min_area, max_area_frac=max_area,
     canny_lo_mult=canny_lo, canny_hi_mult=canny_hi,
-    dilate_iter=int(dilate_iter), border_trim=int(border_trim)
+    dilate_iter=int(dilate_iter), border_trim=int(border_trim),
+    debug_mode=debug_mode
 )
 
 def create_thumbnail(image_data, max_size=300):
@@ -70,6 +101,12 @@ if run_btn and files:
                 if res.get("ok"):
                     img_bytes = res["image_bytes"]
                     zf.writestr(f"{f.name.rsplit('.',1)[0]}_crop.jpg", img_bytes)
+                else:
+                    # Save failed images for debugging
+                    debug_filename = f"debug_failed_{f.name}"
+                    with open(debug_filename, "wb") as debug_file:
+                        debug_file.write(data)
+                    st.info(f"💾 Saved failed image for debugging: {debug_filename}")
 
                 res["meta"] = res.get("meta", {})
                 res["meta"]["latency_ms"] = elapsed
@@ -119,7 +156,7 @@ if run_btn and files:
                 reason = r.get('reason', 'unknown')
                 st.error(f"❌ {f.name}: {reason}")
 
-                # Show debug info for failed images
+                # Show debug info and suggestions for failed images
                 meta = r.get('meta', {})
                 if meta:
                     with st.expander(f"🔍 Debug info for {f.name}"):
@@ -128,6 +165,30 @@ if run_btn and files:
                                 st.text(f"{key}: {value:.3f}")
                             else:
                                 st.text(f"{key}: {value}")
+
+                        # Suggest fixes based on failure reason
+                        st.subheader("💡 Suggested Fixes:")
+                        if reason == "no_quad":
+                            st.write("**Card detection failed. Try:**")
+                            st.write("• Use 'Low Contrast' preset if card/background are similar colors")
+                            st.write("• Use 'Small Card' preset if card appears small in image")
+                            st.write("• Use 'Textured Background' preset for complex backgrounds")
+                            st.write("• Enable debug mode to save failed images for analysis")
+                        elif reason == "area_gate":
+                            area_frac = meta.get('area_frac', 0)
+                            if area_frac > 0.8:
+                                st.write("**Card too large. Try:**")
+                                st.write("• Use 'Large Card' preset")
+                                st.write("• Increase max area fraction")
+                            else:
+                                st.write("**Card too small. Try:**")
+                                st.write("• Use 'Small Card' preset")
+                                st.write("• Decrease min area fraction")
+                        elif reason == "ar_gate":
+                            ar_after = meta.get('ar_after', 0)
+                            st.write(f"**Aspect ratio {ar_after:.3f} too far from 1.586. Try:**")
+                            st.write("• Use 'Extreme Perspective' preset for angled shots")
+                            st.write("• Increase AR tolerance settings")
 
     # Download section
     st.divider()
