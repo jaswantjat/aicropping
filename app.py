@@ -26,17 +26,17 @@ with st.sidebar:
 
     # Set defaults based on preset (updated with improved parameters)
     if preset == "Low Contrast":
-        default_ar_tol, default_min_area, default_dilate = 0.5, 0.06, 3
+        default_ar_tol, default_min_area, default_dilate = 0.5, 0.04, 3
     elif preset == "Textured Background":
-        default_ar_tol, default_min_area, default_dilate = 0.4, 0.08, 1
+        default_ar_tol, default_min_area, default_dilate = 0.4, 0.06, 1
     elif preset == "Small Card":
-        default_ar_tol, default_min_area, default_dilate = 0.6, 0.05, 2
+        default_ar_tol, default_min_area, default_dilate = 0.6, 0.03, 2
     elif preset == "Large Card":
         default_ar_tol, default_min_area, default_dilate = 0.3, 0.15, 2
     elif preset == "Extreme Perspective":
-        default_ar_tol, default_min_area, default_dilate = 0.8, 0.06, 4
+        default_ar_tol, default_min_area, default_dilate = 0.8, 0.04, 4
     else:  # Default or Custom (updated with improved defaults)
-        default_ar_tol, default_min_area, default_dilate = 0.6, 0.08, 2
+        default_ar_tol, default_min_area, default_dilate = 0.6, 0.05, 2
 
     target_height = st.slider("Target height (px)", 400, 1200, 600, 50)
     ar_tol = st.slider("AR tolerance before warp", 0.05, 1.0, default_ar_tol, 0.01)

@@ -15,7 +15,7 @@ ID1_AR = 85.60/53.98  # ~1.586
 class Settings:
     ar_tol: float = 0.6           # allowed deviation around ID1_AR before warp (more lenient for perspective)
     ar_tol_after: float = 0.4     # allowed deviation after warp (more lenient after warping)
-    min_area_frac: float = 0.08   # quad must occupy >= 8% of image (keeps small IDs while rejecting receipts)
+    min_area_frac: float = 0.05   # quad must occupy >= 5% of image (keeps small IDs while rejecting receipts)
     max_area_frac: float = 0.98   # allow larger cards
     max_side_px: int = 1600       # downscale for speed before edge finding
     target_height: int = 600      # target height for output (width computed by AR)
@@ -215,11 +215,58 @@ def refine_quad_with_lines(bgr: np.ndarray, coarse_quad: np.ndarray, debug: bool
 
     return corners
 
+def validate_quad_geometry(box_pts: np.ndarray, debug: bool = False) -> bool:
+    """
+    Validate quad geometry to prevent thin-strip warps and ensure reasonable card shape.
+    """
+    if box_pts.shape != (4, 2):
+        return False
+
+    # Check aspect ratio
+    w = np.linalg.norm(box_pts[1] - box_pts[0])
+    h = np.linalg.norm(box_pts[3] - box_pts[0])
+    if w <= 0 or h <= 0:
+        return False
+
+    ar = max(w, h) / min(w, h)
+    if not (1.45 <= ar <= 1.75):  # Generous for perspective
+        if debug:
+            print(f"   ❌ Invalid aspect ratio: {ar:.3f} (expected 1.45-1.75)")
+        return False
+
+    # Check that corners aren't nearly collinear (prevents strip warps)
+    def angle_at_point(a, b, c):
+        v1, v2 = a - b, c - b
+        cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-9)
+        return np.degrees(np.arccos(np.clip(cos_angle, -1, 1)))
+
+    for i in range(4):
+        a = box_pts[(i-1) % 4]
+        b = box_pts[i]
+        c = box_pts[(i+1) % 4]
+        angle = angle_at_point(a, b, c)
+        if angle < 45 or angle > 135:  # Too acute/obtuse
+            if debug:
+                print(f"   ❌ Invalid corner angle at point {i}: {angle:.1f}° (expected 45-135°)")
+            return False
+
+    if debug:
+        print(f"   ✅ Quad geometry valid: AR={ar:.3f}")
+    return True
+
 def warp_to_id1_canvas(bgr: np.ndarray, box_pts: np.ndarray, width: int = 850, debug: bool = False) -> np.ndarray:
     """
     Warp detected card region to exact ID-1 canvas using 4-point perspective transform.
     This removes skew, fills frame with card, and creates proper top-down scan.
     """
+    # Validate quad geometry before warping
+    if not validate_quad_geometry(box_pts, debug):
+        if debug:
+            print("   ❌ Quad validation failed, using fallback")
+        # Return a black image as fallback
+        height = int(round(width / ID1_AR))
+        return np.zeros((height, width, 3), dtype=np.uint8)
+
     src = order_pts(box_pts.astype(np.float32))
     height = int(round(width / ID1_AR))  # Exact ID-1 aspect ratio
 
@@ -328,7 +375,7 @@ def find_card_quad_simple(bgr: np.ndarray, cfg: Settings) -> Optional[Tuple[np.n
     if candidates:
         best_score, best_pts, best_area_frac = max(candidates, key=lambda x: x[0])
         # Scale back to original image coordinates
-        scaled_pts = best_pts / scale if scale < 1 else best_pts
+        scaled_pts = best_pts / scale
         return scaled_pts.astype("float32"), best_score
 
     return None
@@ -396,11 +443,28 @@ def find_card_quad_advanced(bgr: np.ndarray, cfg: Settings) -> Optional[Tuple[np
         area_frac = area / img_area
         rectangularity = area / box_area  # How rectangular is the contour
 
-        # Composite score: prefer large, rectangular, ID-1 aspect ratio
+        # Additional scoring factors to avoid background patches
+        # 1. Border distance penalty (avoid edge-touching candidates)
+        box_center_x = np.mean(box[:, 0])
+        box_center_y = np.mean(box[:, 1])
+        border_dist = min(box_center_x, box_center_y,
+                         img.shape[1] - box_center_x, img.shape[0] - box_center_y)
+        border_penalty = max(0, 1.0 - border_dist / (min(img.shape[:2]) * 0.1))
+
+        # 2. Brightness uniformity (cards are more uniform than textured backgrounds)
+        mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(mask, [box.astype(np.int32)], 255)
+        roi_pixels = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)[mask > 0]
+        brightness_std = np.std(roi_pixels) if len(roi_pixels) > 0 else 255
+        uniformity_score = max(0, 1.0 - brightness_std / 128.0)  # Lower std = higher score
+
+        # Composite score: prefer large, rectangular, ID-1 aspect ratio, uniform, centered
         score = (
             2.0 * area_frac +           # Size importance
-            1.0 * rectangularity +      # Shape regularity
-            -1.0 * ar_error            # Aspect ratio closeness
+            1.5 * rectangularity +      # Shape regularity (increased weight)
+            -1.0 * ar_error +           # Aspect ratio closeness
+            0.8 * uniformity_score +    # Brightness uniformity (cards vs texture)
+            -0.5 * border_penalty       # Penalty for edge-touching candidates
         )
 
         # Filter candidates
@@ -415,7 +479,7 @@ def find_card_quad_advanced(bgr: np.ndarray, cfg: Settings) -> Optional[Tuple[np
         # Get best candidate by score
         best_score, best_box, best_area_frac = max(candidates, key=lambda x: x[0])
         # Scale back to original image coordinates
-        scaled_box = best_box / scale if scale < 1 else best_box
+        scaled_box = best_box / scale
         return order_pts(scaled_box.astype("float32")), best_score
 
     return None
@@ -483,7 +547,7 @@ def find_card_quad_color_assisted(bgr: np.ndarray, cfg: Settings) -> Optional[Tu
     if candidates:
         best_score, best_box, best_area_frac = max(candidates, key=lambda x: x[0])
         # Scale back to original image coordinates
-        scaled_box = best_box / scale if scale < 1 else best_box
+        scaled_box = best_box / scale
         return order_pts(scaled_box.astype("float32")), best_score
 
     return None
