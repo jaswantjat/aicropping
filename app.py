@@ -24,7 +24,7 @@ with st.sidebar:
         "Custom"
     ])
 
-    # Set defaults based on preset
+    # Set defaults based on preset (updated with improved parameters)
     if preset == "Low Contrast":
         default_ar_tol, default_min_area, default_dilate = 0.5, 0.01, 3
     elif preset == "Textured Background":
@@ -35,21 +35,21 @@ with st.sidebar:
         default_ar_tol, default_min_area, default_dilate = 0.3, 0.3, 2
     elif preset == "Extreme Perspective":
         default_ar_tol, default_min_area, default_dilate = 0.8, 0.01, 4
-    else:  # Default or Custom
-        default_ar_tol, default_min_area, default_dilate = 0.35, 0.02, 2
+    else:  # Default or Custom (updated with improved defaults)
+        default_ar_tol, default_min_area, default_dilate = 0.6, 0.005, 2
 
     target_height = st.slider("Target height (px)", 400, 1200, 600, 50)
     ar_tol = st.slider("AR tolerance before warp", 0.05, 1.0, default_ar_tol, 0.01)
-    ar_tol_after = st.slider("AR tolerance after warp", 0.05, 0.50, 0.25, 0.01)
+    ar_tol_after = st.slider("AR tolerance after warp", 0.05, 0.50, 0.4, 0.01)  # Updated default
     min_area = st.slider("Min area fraction", 0.001, 0.50, default_min_area, 0.001)
-    max_area = st.slider("Max area fraction", 0.70, 1.00, 0.99, 0.01)
+    max_area = st.slider("Max area fraction", 0.70, 1.00, 0.98, 0.01)  # Updated default
     dilate_iter = st.selectbox("Dilate iterations", [0,1,2,3,4], index=default_dilate)
     border_trim = st.number_input("Border trim (px)", 0, 10, 2)
 
     st.subheader("Advanced")
     with st.expander("Edge Detection"):
-        canny_lo = st.slider("Canny low mult", 0.3, 1.0, 0.5, 0.01)
-        canny_hi = st.slider("Canny high mult", 1.0, 2.5, 1.5, 0.01)
+        canny_lo = st.slider("Canny low mult", 0.3, 1.0, 0.4, 0.01)  # Updated default
+        canny_hi = st.slider("Canny high mult", 1.0, 2.5, 1.8, 0.01)  # Updated default
 
     with st.expander("Debug Options"):
         debug_mode = st.checkbox("Enable debug mode", help="Save failed images and show detailed debug info")

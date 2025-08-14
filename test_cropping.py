@@ -76,23 +76,30 @@ def test_with_image(image_path):
         
         return False
 
+def should_process_file(filename):
+    """Prevent processing already-processed files to avoid recursive processing"""
+    skip_patterns = ['cropped_', 'smoke_test_', 'debug_', 'output_', 'synthetic_']
+    return not any(pattern in filename.lower() for pattern in skip_patterns)
+
 def main():
     print("🎯 ID Card Cropping Test Suite")
     print("=" * 50)
-    
+
     # Test with our synthetic image first
     success_count = 0
     total_tests = 0
-    
+
     if os.path.exists("test_id_card.png"):
         total_tests += 1
         if test_with_image("test_id_card.png"):
             success_count += 1
-    
-    # Look for any other images in the current directory
+
+    # Look for any other images in the current directory, but skip processed files
     image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp']
     for file in os.listdir('.'):
-        if any(file.lower().endswith(ext) for ext in image_extensions) and file != "test_id_card.png":
+        if (any(file.lower().endswith(ext) for ext in image_extensions) and
+            file != "test_id_card.png" and
+            should_process_file(file)):
             total_tests += 1
             if test_with_image(file):
                 success_count += 1

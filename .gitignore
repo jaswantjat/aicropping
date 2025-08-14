@@ -9,3 +9,11 @@ logs/
 process_log.jsonl
 .streamlit/
 .DS_Store
+
+# Output files from processing
+cropped_*
+smoke_test_*
+debug_output/
+test_output/
+debug_failed_*
+synthetic_*

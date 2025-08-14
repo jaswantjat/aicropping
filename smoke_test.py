@@ -70,11 +70,16 @@ def test_with_settings(image_path, **kwargs):
         
         return False
 
+def should_process_file(filename):
+    """Prevent processing already-processed files to avoid recursive processing"""
+    skip_patterns = ['cropped_', 'smoke_test_', 'debug_', 'output_', 'synthetic_']
+    return not any(pattern in str(filename).lower() for pattern in skip_patterns)
+
 def run_smoke_tests():
     """Run comprehensive smoke tests"""
     print("🚀 Starting AI Cropping Pipeline Smoke Tests")
     print("=" * 60)
-    
+
     # Test cases with different settings
     test_cases = [
         {
@@ -98,12 +103,17 @@ def run_smoke_tests():
             "settings": {"dilate_iter": 3, "canny_lo_mult": 0.4, "canny_hi_mult": 1.8}
         }
     ]
-    
-    # Look for test images
+
+    # Look for test images, but skip processed files
     test_images = []
     for pattern in ["*.jpg", "*.jpeg", "*.png"]:
-        test_images.extend(Path(".").glob(pattern))
-        test_images.extend(Path("raw").glob(pattern) if Path("raw").exists() else [])
+        for img in Path(".").glob(pattern):
+            if should_process_file(img):
+                test_images.append(img)
+        if Path("raw").exists():
+            for img in Path("raw").glob(pattern):
+                if should_process_file(img):
+                    test_images.append(img)
     
     if not test_images:
         print("⚠️  No test images found. Creating a synthetic test image...")

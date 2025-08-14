@@ -13,16 +13,15 @@ ID1_AR = 85.60/53.98  # ~1.586
 
 @dataclass
 class Settings:
-    ar_tol: float = 0.35          # allowed deviation around ID1_AR before warp (more lenient)
-    ar_tol_after: float = 0.25    # allowed deviation after warp (more lenient)
-    min_area_frac: float = 0.02   # quad must occupy >= 2% of image (lower threshold)
-    max_area_frac: float = 0.99
+    ar_tol: float = 0.6           # allowed deviation around ID1_AR before warp (more lenient for perspective)
+    ar_tol_after: float = 0.4     # allowed deviation after warp (more lenient after warping)
+    min_area_frac: float = 0.005  # quad must occupy >= 0.5% of image (detect smaller cards)
+    max_area_frac: float = 0.98   # allow larger cards
     max_side_px: int = 1600       # downscale for speed before edge finding
-    warp_w: int = 1024            # output width (height computed by AR) - DEPRECATED
     target_height: int = 600      # target height for output (width computed by AR)
     jpeg_quality: int = 92
-    canny_lo_mult: float = 0.5    # lower threshold for better edge detection
-    canny_hi_mult: float = 1.5    # higher threshold for better edge detection
+    canny_lo_mult: float = 0.4    # lower threshold for better edge detection
+    canny_hi_mult: float = 1.8    # higher threshold for better edge detection
     dilate_iter: int = 2          # more dilation to connect edges
     border_trim: int = 2          # pixels to trim after warp
     debug_mode: bool = False      # enable debug visualization
@@ -58,6 +57,25 @@ def order_pts(pts: np.ndarray) -> np.ndarray:
     bl = pts[np.argmax(d)]
 
     return np.array([tl, tr, br, bl], dtype="float32")
+
+def find_card_by_color(bgr: np.ndarray) -> np.ndarray:
+    """
+    Spanish ID cards have distinctive white/light background.
+    This creates a mask for potential card regions based on color.
+    """
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+    # Detect white/light regions (typical for ID cards)
+    lower_white = np.array([0, 0, 180])    # Low saturation, high value
+    upper_white = np.array([180, 50, 255]) # Any hue, low saturation, high value
+    white_mask = cv2.inRange(hsv, lower_white, upper_white)
+
+    # Clean up the mask
+    kernel = np.ones((5,5), np.uint8)
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel)
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
+
+    return white_mask
 
 def warp_to_id1_canvas(bgr: np.ndarray, box_pts: np.ndarray, width: int = 850) -> np.ndarray:
     """
@@ -192,9 +210,14 @@ def find_card_quad_advanced(bgr: np.ndarray, cfg: Settings) -> Optional[Tuple[np
         (_, _), (w, h), angle = rect
         ar = max(w, h) / min(w, h) if min(w, h) > 0 else 0
 
+        # Handle both landscape and portrait orientations
+        # Spanish ID cards are typically landscape (1.586), but check both orientations
+        ar_error_landscape = abs(ar - ID1_AR) / ID1_AR
+        ar_error_portrait = abs(ar - (1/ID1_AR)) / (1/ID1_AR)
+        ar_error = min(ar_error_landscape, ar_error_portrait)
+
         # Score based on multiple factors
         area_frac = area / img_area
-        ar_error = abs(ar - ID1_AR) / ID1_AR
         rectangularity = area / box_area  # How rectangular is the contour
 
         # Composite score: prefer large, rectangular, ID-1 aspect ratio
@@ -221,10 +244,77 @@ def find_card_quad_advanced(bgr: np.ndarray, cfg: Settings) -> Optional[Tuple[np
 
     return None
 
+def find_card_quad_color_assisted(bgr: np.ndarray, cfg: Settings) -> Optional[Tuple[np.ndarray, float]]:
+    """
+    Color-assisted detection as a last resort fallback.
+    Uses color information to guide edge detection.
+    """
+    # Get color mask for potential card regions
+    color_mask = find_card_by_color(bgr)
+
+    # Use color mask to guide contour detection
+    H, W = bgr.shape[:2]
+    scale = cfg.max_side_px / max(H, W)
+    img = cv2.resize(bgr, None, fx=scale, fy=scale) if scale < 1 else bgr.copy()
+    mask_scaled = cv2.resize(color_mask, (img.shape[1], img.shape[0])) if scale < 1 else color_mask
+
+    # Find contours in the color mask
+    cnts, _ = cv2.findContours(mask_scaled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+
+    img_area = img.shape[0] * img.shape[1]
+    candidates = []
+
+    for cnt in cnts:
+        area = cv2.contourArea(cnt)
+        if area < cfg.min_area_frac * img_area:
+            continue
+
+        # Get minimum area rectangle
+        rect = cv2.minAreaRect(cnt)
+        box = cv2.boxPoints(rect)
+        box_area = cv2.contourArea(box)
+
+        if box_area <= 0:
+            continue
+
+        # Calculate metrics
+        (_, _), (w, h), angle = rect
+        ar = max(w, h) / min(w, h) if min(w, h) > 0 else 0
+        area_frac = area / img_area
+        rectangularity = area / box_area
+
+        # More lenient scoring for color-based detection
+        ar_error_landscape = abs(ar - ID1_AR) / ID1_AR
+        ar_error_portrait = abs(ar - (1/ID1_AR)) / (1/ID1_AR)
+        ar_error = min(ar_error_landscape, ar_error_portrait)
+
+        score = (
+            1.5 * area_frac +           # Size importance
+            0.8 * rectangularity +      # Shape regularity
+            -0.5 * ar_error            # Aspect ratio closeness (less strict)
+        )
+
+        # Very lenient filtering for color-based method
+        if (0.5 < ar < 3.0 and                      # Very wide aspect ratio range
+            area_frac > cfg.min_area_frac and       # Minimum size
+            area_frac <= cfg.max_area_frac and      # Maximum size
+            rectangularity > 0.5):                 # Less strict rectangularity
+
+            candidates.append((score, box, area_frac))
+
+    if candidates:
+        best_score, best_box, best_area_frac = max(candidates, key=lambda x: x[0])
+        scaled_box = best_box / (scale if scale < 1 else 1)
+        return order_pts(scaled_box.astype("float32")), best_score
+
+    return None
+
 def find_card_quad(bgr: np.ndarray, cfg: Settings, debug: bool = False) -> Optional[Tuple[np.ndarray, float]]:
     """
-    Hybrid card detection strategy: try simple method first, fall back to advanced.
-    This prevents over-engineering from breaking working cases.
+    Triple-fallback card detection strategy: simple -> advanced -> color-assisted.
+    This provides maximum robustness across different image conditions.
     """
     # Strategy 1: Simple threshold (good for high-contrast, clean backgrounds)
     result = find_card_quad_simple(bgr, cfg)
@@ -242,8 +332,16 @@ def find_card_quad(bgr: np.ndarray, cfg: Settings, debug: bool = False) -> Optio
             print(f"✅ Advanced method succeeded with score: {score:.3f}")
         return result
 
+    # Strategy 3: Color-assisted method (last resort for difficult cases)
+    result = find_card_quad_color_assisted(bgr, cfg)
+    if result is not None:
+        quad, score = result
+        if debug:
+            print(f"✅ Color-assisted method succeeded with score: {score:.3f}")
+        return result
+
     if debug:
-        print("❌ Both methods failed to find card")
+        print("❌ All three methods failed to find card")
 
     return None
 
