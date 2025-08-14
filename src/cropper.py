@@ -15,7 +15,7 @@ ID1_AR = 85.60/53.98  # ~1.586
 class Settings:
     ar_tol: float = 0.6           # allowed deviation around ID1_AR before warp (more lenient for perspective)
     ar_tol_after: float = 0.4     # allowed deviation after warp (more lenient after warping)
-    min_area_frac: float = 0.005  # quad must occupy >= 0.5% of image (detect smaller cards)
+    min_area_frac: float = 0.08   # quad must occupy >= 8% of image (keeps small IDs while rejecting receipts)
     max_area_frac: float = 0.98   # allow larger cards
     max_side_px: int = 1600       # downscale for speed before edge finding
     target_height: int = 600      # target height for output (width computed by AR)
@@ -109,12 +109,16 @@ def find_card_quad_simple(bgr: np.ndarray, cfg: Settings) -> Optional[Tuple[np.n
     scale = cfg.max_side_px / max(H, W)
     img = cv2.resize(bgr, None, fx=scale, fy=scale) if scale < 1 else bgr.copy()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Apply CLAHE to suppress background texture and enhance card edges
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # Simple adaptive Canny thresholds based on median
+    # Adaptive Canny thresholds - reduced upper bound to minimize background noise
     v = np.median(gray)
     lower = int(max(0, 0.66 * v))
-    upper = int(min(255, 1.33 * v))
+    upper = int(min(255, 1.15 * v))  # Reduced from 1.33 to 1.15 to suppress texture
     edges = cv2.Canny(gray, lower, upper)
 
     if cfg.dilate_iter > 0:
@@ -146,7 +150,8 @@ def find_card_quad_simple(bgr: np.ndarray, cfg: Settings) -> Optional[Tuple[np.n
                 ar = w/h
                 ar_err = abs(ar - ID1_AR) / ID1_AR
 
-                if ar_err <= cfg.ar_tol:
+                # Stricter aspect ratio filter to reject background rectangles
+                if 1.50 < ar < 1.65 and ar_err <= cfg.ar_tol:
                     score = 2.0 * area_frac - 0.6 * ar_err
                     candidates.append((score, pts_o, area_frac))
 

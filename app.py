@@ -26,17 +26,17 @@ with st.sidebar:
 
     # Set defaults based on preset (updated with improved parameters)
     if preset == "Low Contrast":
-        default_ar_tol, default_min_area, default_dilate = 0.5, 0.01, 3
+        default_ar_tol, default_min_area, default_dilate = 0.5, 0.06, 3
     elif preset == "Textured Background":
-        default_ar_tol, default_min_area, default_dilate = 0.4, 0.05, 1
+        default_ar_tol, default_min_area, default_dilate = 0.4, 0.08, 1
     elif preset == "Small Card":
-        default_ar_tol, default_min_area, default_dilate = 0.6, 0.005, 2
+        default_ar_tol, default_min_area, default_dilate = 0.6, 0.05, 2
     elif preset == "Large Card":
-        default_ar_tol, default_min_area, default_dilate = 0.3, 0.3, 2
+        default_ar_tol, default_min_area, default_dilate = 0.3, 0.15, 2
     elif preset == "Extreme Perspective":
-        default_ar_tol, default_min_area, default_dilate = 0.8, 0.01, 4
+        default_ar_tol, default_min_area, default_dilate = 0.8, 0.06, 4
     else:  # Default or Custom (updated with improved defaults)
-        default_ar_tol, default_min_area, default_dilate = 0.6, 0.005, 2
+        default_ar_tol, default_min_area, default_dilate = 0.6, 0.08, 2
 
     target_height = st.slider("Target height (px)", 400, 1200, 600, 50)
     ar_tol = st.slider("AR tolerance before warp", 0.05, 1.0, default_ar_tol, 0.01)
@@ -93,24 +93,34 @@ if run_btn and files:
                 status_text.text(f"Processing {f.name}...")
                 progress_bar.progress((i + 1) / len(files))
 
-                data = f.read()
-                t0 = time.time()
-                res = process_image_bytes(data, cfg)
-                elapsed = int(1000*(time.time()-t0))
+                try:
+                    data = f.read()
+                    t0 = time.time()
+                    res = process_image_bytes(data, cfg)
+                    elapsed = int(1000*(time.time()-t0))
 
-                if res.get("ok"):
-                    img_bytes = res["image_bytes"]
-                    zf.writestr(f"{f.name.rsplit('.',1)[0]}_crop.jpg", img_bytes)
-                else:
-                    # Save failed images for debugging
-                    debug_filename = f"debug_failed_{f.name}"
-                    with open(debug_filename, "wb") as debug_file:
-                        debug_file.write(data)
-                    st.info(f"💾 Saved failed image for debugging: {debug_filename}")
+                    if res.get("ok"):
+                        img_bytes = res["image_bytes"]
+                        zf.writestr(f"{f.name.rsplit('.',1)[0]}_crop.jpg", img_bytes)
+                    else:
+                        # Save failed images for debugging
+                        debug_filename = f"debug_failed_{f.name}"
+                        with open(debug_filename, "wb") as debug_file:
+                            debug_file.write(data)
+                        st.info(f"💾 Saved failed image for debugging: {debug_filename}")
 
-                res["meta"] = res.get("meta", {})
-                res["meta"]["latency_ms"] = elapsed
-                results.append((f, res))
+                    res["meta"] = res.get("meta", {})
+                    res["meta"]["latency_ms"] = elapsed
+                    results.append((f, res))
+
+                except Exception as e:
+                    st.error(f"❌ Crop failed for {f.name}: {str(e)}")
+                    # Create a failed result entry
+                    results.append((f, {
+                        "ok": False,
+                        "reason": f"exception: {str(e)}",
+                        "meta": {"latency_ms": 0}
+                    }))
 
         status_text.text("✅ Processing complete!")
         time.sleep(0.5)  # Brief pause to show completion

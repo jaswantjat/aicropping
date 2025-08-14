@@ -71,15 +71,21 @@ def debug_simple_method(bgr, cfg, output_dir):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     cv2.imwrite(f"{output_dir}/02_simple_gray.jpg", gray)
     print(f"   Gray image saved: {gray.shape}")
-    
-    # Step 2: Gaussian blur
+
+    # Step 2: CLAHE preprocessing to suppress background texture
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+    cv2.imwrite(f"{output_dir}/02b_simple_clahe.jpg", gray)
+    print(f"   CLAHE applied")
+
+    # Step 3: Gaussian blur
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     cv2.imwrite(f"{output_dir}/03_simple_blur.jpg", gray)
     
-    # Step 3: Adaptive Canny
+    # Step 4: Adaptive Canny (updated thresholds to match cropper.py)
     v = np.median(gray)
     lower = int(max(0, 0.66 * v))
-    upper = int(min(255, 1.33 * v))
+    upper = int(min(255, 1.15 * v))  # Reduced to suppress background texture
     print(f"   Median: {v:.1f}, Canny thresholds: {lower}-{upper}")
     
     edges = cv2.Canny(gray, lower, upper)
@@ -138,10 +144,10 @@ def debug_advanced_method(bgr, cfg, output_dir):
     gray = cv2.GaussianBlur(l_enhanced, (5, 5), 0)
     cv2.imwrite(f"{output_dir}/10_advanced_blur.jpg", gray)
     
-    # Step 4: Canny
+    # Step 4: Canny (updated thresholds to match cropper.py)
     v = np.median(gray)
     lower = int(max(0, 0.66 * v))
-    upper = int(min(255, 1.33 * v))
+    upper = int(min(255, 1.15 * v))  # Reduced to suppress background texture
     print(f"   Median: {v:.1f}, Canny thresholds: {lower}-{upper}")
     
     edges = cv2.Canny(gray, lower, upper)
